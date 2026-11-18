@@ -14,14 +14,15 @@
     </div>
     <table class="data-table">
       <thead>
-        <tr><th>业务模块</th><th>今日新增</th><th>待处理</th><th>异常量</th></tr>
+        <tr><th>业务模块</th><th>今日新增</th><th>待处理</th><th>异常量</th><th>已落库成员明细</th></tr>
       </thead>
       <tbody>
-        <tr v-for="row in moduleRows" :key="row.name">
+        <tr v-for="row in moduleRows" :key="row.name" :data-testid="`overview-${row.name}`">
           <td>{{ row.name }}</td>
           <td>{{ row.created }}</td>
           <td>{{ row.pending }}</td>
           <td>{{ row.abnormal }}</td>
+          <td>{{ row.members ?? '—' }}</td>
         </tr>
       </tbody>
     </table>
@@ -35,7 +36,7 @@ import { fetchJson } from '@/api/client'
 
 type Overview = {
   cards: { label: string; value: number }[]
-  modules: { name: string; created: number; pending: number; abnormal: number }[]
+  modules: { name: string; created: number; pending: number; abnormal: number; members?: number }[]
 }
 
 const cards = ref<Overview['cards']>([])

@@ -1,4 +1,4 @@
-"""样本分群接口：维护样本分群，覆盖开始计算、确认就绪、标记过期等动作。"""
+"""样本分群接口：维护样本分群，并提供成员明细、版本与恢复/发布裁决能力。"""
 from __future__ import annotations
 
 import csv
@@ -7,12 +7,20 @@ import io
 from fastapi import APIRouter, HTTPException, Query, Request
 from fastapi.responses import StreamingResponse
 
-from app.schemas import ActionPayload, ActionResult, EntryPayload, PageResult
+from app.schemas import ActionPayload, ActionResult, PageResult
+from app.services.group_member import (
+    PUBLISH_NEW_FIRST,
+    PUBLISH_OLD_FIRST,
+    GroupMemberService,
+    ResidueError,
+    RuleViolation,
+)
 from app.services.sample_group import SampleGroupService
 
 router = APIRouter(prefix="/api/sample_group", tags=["样本分群"])
 
 service = SampleGroupService()
+member_service = GroupMemberService()
 
 LIST_FIELDS = ["分群编号", "分群名称", "筛选条件", "样本基数", "分群日期", "更新方式", "有效天数", "负责人"]
 STATUSES = ["草稿", "计算中", "已就绪", "已过期"]
@@ -53,16 +61,100 @@ def export_entries(
     output = io.StringIO()
     output.write("\ufeff")
     writer = csv.writer(output, lineterminator="\n")
-    writer.writerow(["id", *LIST_FIELDS, "status"])
+    writer.writerow(["id", *LIST_FIELDS, "status", "member_count", "filter_version_no"])
     for item in items:
         row = []
-        for value in [item.get("id"), *(item.get(field, "") for field in LIST_FIELDS), item.get("status", "")]:
+        values = [
+            item.get("id"),
+            *(item.get(field, "") for field in LIST_FIELDS),
+            item.get("status", ""),
+            item.get("member_count", 0),
+            item.get("filter_version_no", ""),
+        ]
+        for value in values:
             text = "" if value is None else str(value)
             row.append("'" + text if text.startswith(("=", "+", "-", "@")) else text)
         writer.writerow(row)
     return StreamingResponse(
         iter([output.getvalue()]), media_type="text/csv; charset=utf-8",
         headers={"Content-Disposition": 'attachment; filename="sample_group.csv"'})
+
+
+@router.get("/{entry_id}/members", response_model=PageResult[dict])
+def list_members(
+    entry_id: int,
+    version_no: int | None = Query(default=None, description="按筛选条件版本号回查成员明细"),
+    page: int = Query(default=1, ge=1),
+    size: int = Query(default=20, ge=1, le=500),
+) -> PageResult[dict]:
+    """读取分群成员明细（成员页抽屉与导航页共用同一份已落库业务数据）。"""
+    if service.get_entry(entry_id) is None:
+        raise HTTPException(status_code=404, detail=f"样本分群 {entry_id} 不存在或已归档")
+    try:
+        items, total = member_service.list_members(
+            entry_id, version_no=version_no, page=page, size=size)
+    except (RuleViolation, ResidueError) as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    return PageResult(items=items, total=total, page=page, size=size)
+
+
+@router.get("/{entry_id}/versions")
+def list_versions(entry_id: int) -> dict[str, object]:
+    """回查筛选条件版本链：成员数量可追溯到每个版本及其归档状态。"""
+    if service.get_entry(entry_id) is None:
+        raise HTTPException(status_code=404, detail=f"样本分群 {entry_id} 不存在或已归档")
+    versions = member_service.list_versions(entry_id)
+    for version in versions:
+        version["member_count"] = len(member_service._version_members(entry_id, int(version["id"])))
+    return {"items": versions, "total": len(versions)}
+
+
+@router.post("/{entry_id}/resume", response_model=ActionResult)
+def resume_members(entry_id: int) -> ActionResult:
+    """计算中断后恢复：只补齐未完成成员，不重复写入同一 user_id。"""
+    try:
+        result = member_service.resume_members(entry_id)
+    except ResidueError as exc:
+        return ActionResult(ok=False, message=f"恢复时发现残留，事务已整体回滚：{exc}")
+    except RuleViolation as exc:
+        return ActionResult(ok=False, message=f"恢复未通过口径判定：{exc}")
+    return ActionResult(ok=True, message="中断成员已补齐，未重复写入用户记录", entry=result)
+
+
+@router.post("/{entry_id}/reconcile", response_model=ActionResult)
+def reconcile_residue(entry_id: int) -> ActionResult:
+    """残留核对：按成员页旧数据核对，发现残留时事务整体回滚（V004 留档核对）。"""
+    try:
+        result = member_service.reconcile_residue(entry_id)
+    except ResidueError as exc:
+        return ActionResult(ok=False, message=str(exc))
+    except RuleViolation as exc:
+        return ActionResult(ok=False, message=str(exc))
+    return ActionResult(ok=True, message=result["message"], entry=result)
+
+
+@router.post("/{entry_id}/publish", response_model=ActionResult)
+def publish_members(entry_id: int, payload: ActionPayload) -> ActionResult:
+    """版本冲突裁决：新成员优先（先发布新成员再归档旧规则）或旧规则优先。
+
+    动作名通过 payload.action 传入：新成员优先 / 旧规则优先。
+    """
+    mode = PUBLISH_OLD_FIRST if payload.action.strip() == PUBLISH_OLD_FIRST else PUBLISH_NEW_FIRST
+    try:
+        result = member_service.publish(entry_id, mode)
+    except (RuleViolation, ResidueError) as exc:
+        return ActionResult(ok=False, message=str(exc))
+    return ActionResult(ok=True, message=f"已按「{mode}」裁决发布次序", entry=result)
+
+
+@router.post("/{entry_id}/switch-version", response_model=ActionResult)
+def switch_version(entry_id: int) -> ActionResult:
+    """旧规则优先模式下，确认切换到待切换的新成员集合。"""
+    try:
+        result = member_service.switch_pending_version(entry_id)
+    except (RuleViolation, ResidueError) as exc:
+        return ActionResult(ok=False, message=str(exc))
+    return ActionResult(ok=True, message="已切换到新筛选条件版本的成员集合", entry=result)
 
 
 @router.get("/{entry_id}", response_model=dict)

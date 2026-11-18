@@ -3,6 +3,7 @@ from __future__ import annotations
 
 from typing import Any
 
+from app.services.group_member import GroupMemberService
 from app.store import store
 
 MODULE = "metric_def"
@@ -14,6 +15,9 @@ NEGATIVE_ACTIONS = []
 
 
 class MetricDefService:
+    def __init__(self) -> None:
+        # V004 跨模块联动：指标定义模块读取分群成员明细做口径校验
+        self.group_members = GroupMemberService()
     def list_entries(
         self,
         *,
@@ -63,3 +67,43 @@ class MetricDefService:
         entry["pending"] = target != STATUS_ORDER[-1]
         entry["abnormal"] = action in NEGATIVE_ACTIONS
         return entry, f"指标定义已{action}"
+
+    # ------------------------------------------------------------------ #
+    # V004 跨模块联动：读取分群成员明细中的指标值，按字段口径逐条校验
+    # ------------------------------------------------------------------ #
+    def validate_group_members(self, entry_id: int, group_id: int) -> dict[str, Any]:
+        """按指标定义的字段口径（精度位数、基准取值）校验每个分群成员记录。"""
+        entry = store.find(MODULE, entry_id)
+        if entry is None:
+            return {"ok": False, "message": f"指标定义 {entry_id} 不存在或已归档"}
+        try:
+            precision = int(float(entry.get("精度位数") or 4))
+        except (TypeError, ValueError):
+            precision = 4
+        precision = max(0, min(precision, 10))
+        try:
+            baseline = float(entry.get("基准取值") or 0.0)
+        except (TypeError, ValueError):
+            baseline = None
+        report = self.group_members.validate_for_metric(group_id, precision=precision)
+        # 在成员明细通用校验之上，叠加指标定义自身的基准取值口径
+        version = self.group_members.current_version(group_id)
+        if version is not None and baseline is not None:
+            members, _ = self.group_members.list_members(group_id, page=1, size=1000000)
+            baseline_issues: list[dict[str, Any]] = []
+            for member in members:
+                value = member.get("metric_value")
+                if isinstance(value, (int, float)) and float(value) < baseline:
+                    baseline_issues.append({
+                        "user_id": member.get("user_id"),
+                        "reason": f"指标值 {value} 低于基准取值 {baseline}",
+                    })
+            report["issues"].extend(baseline_issues)
+            report["failed"] = len(report["issues"])
+            report["passed"] = max(0, int(report.get("total", 0)) - report["failed"])
+        report["ok"] = not report.get("issues")
+        report["metric_def_id"] = entry_id
+        report["metric_code"] = entry.get("指标编号")
+        report["precision"] = precision
+        report["baseline"] = baseline
+        return report

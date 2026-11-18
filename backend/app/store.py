@@ -11,6 +11,9 @@ from app.seed import SEED_ROWS
 
 
 class Store:
+    # 内部明细表（分群成员、筛选条件版本等）不属于导航业务模块，不在概览中计数
+    INTERNAL_TABLES = {"sample_group_member", "sample_group_filter_version"}
+
     def __init__(self) -> None:
         self._tables: dict[str, list[dict[str, Any]]] = {
             name: [dict(row) for row in rows] for name, rows in SEED_ROWS.items()
@@ -19,7 +22,7 @@ class Store:
         self._created_at: dict[str, float] = {name: time.time() for name in self._tables}
 
     def module_names(self) -> list[str]:
-        return sorted(self._tables)
+        return sorted(name for name in self._tables if name not in self.INTERNAL_TABLES)
 
     def rows(self, module: str) -> list[dict[str, Any]]:
         return self._tables.setdefault(module, [])
@@ -54,11 +57,14 @@ class Store:
         modules: list[dict[str, object]] = []
         for name in self.module_names():
             rows = self.rows(name)
+            # 概览/导航与成员抽屉读取同一业务数据：样本分群直接统计已落库的成员明细
+            members = len(self.rows("sample_group_member")) if name == "sample_group" else 0
             modules.append({
                 "name": name,
                 "created": len(rows),
                 "pending": sum(1 for row in rows if row.get("pending")),
                 "abnormal": sum(1 for row in rows if row.get("abnormal")),
+                "members": members,
             })
         cards = [
             {"label": "业务模块", "value": len(modules)},

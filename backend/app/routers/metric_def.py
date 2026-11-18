@@ -83,6 +83,15 @@ def create_entry(payload: dict[str, object]) -> ActionResult:
     return ActionResult(ok=True, message="指标定义已登记", entry=entry)
 
 
+@router.post("/{entry_id}/validate-group/{group_id}", response_model=ActionResult)
+def validate_group_members(entry_id: int, group_id: int) -> ActionResult:
+    """V004 跨模块联动：读取分群成员明细指标值，按本指标的字段口径逐条校验。"""
+    report = service.validate_group_members(entry_id, group_id)
+    if not report.get("ok"):
+        return ActionResult(ok=False, message=report.get("message", "成员记录未全部通过字段口径校验"), entry=report)
+    return ActionResult(ok=True, message=f"分群 {group_id} 全部 {report.get('total', 0)} 条成员记录通过口径校验", entry=report)
+
+
 @router.post("/{entry_id}/actions", response_model=ActionResult)
 def run_action(entry_id: int, payload: ActionPayload) -> ActionResult:
     """对单条指标定义执行提交校验、标记生效、标记废弃；不允许的动作会被拦下并说明原因。"""

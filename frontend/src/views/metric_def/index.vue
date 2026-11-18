@@ -72,6 +72,25 @@
       </form>
     </div>
 
+    <section class="filter-bar" data-testid="v004-validation">
+      <label class="filter-item">
+        <span>V004 指标定义</span>
+        <select v-model="validateMetricId" data-testid="v004-metric-id">
+          <option v-for="row in rows" :key="String(row.id)" :value="Number(row.id)">
+            {{ row['指标编号'] }}（id={{ row.id }}）
+          </option>
+        </select>
+      </label>
+      <label class="filter-item">
+        <span>待校验样本分群 id</span>
+        <input v-model="validateGroupId" data-testid="v004-group-id" placeholder="输入样本分群 id" />
+      </label>
+      <button class="btn primary" type="button" data-testid="v004-validate" @click="validateGroupMembers">
+        读取分群成员明细并按字段口径校验
+      </button>
+      <span v-if="v004Message" class="error-text" data-testid="v004-message">{{ v004Message }}</span>
+    </section>
+
     <footer class="page-foot">
       <span>共 {{ total }} 条指标定义记录</span>
       <span v-if="errorMessage" class="error-text">{{ errorMessage }}</span>
@@ -100,6 +119,11 @@ const filterFields = columns.slice(0, 3)
 const showCreate = ref(false)
 const creating = ref(false)
 const createValues = ref<Record<string, string>>({})
+
+// V004 跨模块联动：指标定义模块读取分群成员明细的指标值并按字段口径逐条校验
+const validateMetricId = ref<number | null>(null)
+const validateGroupId = ref('')
+const v004Message = ref('')
 const stats = computed(() => [
   { label: metricNames[0], value: total.value },
   { label: metricNames[1], value: rows.value.filter((row) => row.status === statuses[1]).length },
@@ -184,5 +208,28 @@ async function reload() {
   }
 }
 
-onMounted(reload)
+onMounted(() => {
+  void reload()
+})
+
+async function validateGroupMembers() {
+  v004Message.value = ''
+  const metricId = validateMetricId.value
+  const groupId = Number(validateGroupId.value)
+  if (!metricId || !Number.isInteger(groupId) || groupId <= 0) {
+    v004Message.value = '请选择指标定义并填写有效的样本分群 id'
+    return
+  }
+  try {
+    const response = await request(`${ENDPOINT}/${metricId}/validate-group/${groupId}`, { method: 'POST' })
+    const payload = await response.json()
+    if (!response.ok || !payload.ok) {
+      const detail = payload.entry ? `${payload.message}：失败 ${payload.entry.failed ?? 0} 条` : payload.message
+      throw new Error(detail || '口径校验未通过')
+    }
+    v004Message.value = payload.message
+  } catch (error) {
+    v004Message.value = error instanceof Error ? error.message : '口径校验失败'
+  }
+}
 </script>
